@@ -475,4 +475,17 @@ int nvidia_p2p_get_rsync_registers(nvidia_p2p_rsync_reg_info_t **reg_info);
  */
 void nvidia_p2p_put_rsync_registers(nvidia_p2p_rsync_reg_info_t *reg_info);
 
+/*
+ * Scheme-A (URMA POC): debug printk and SG build using physical_address as DMA.
+ */
+#define NVIDIA_P2P_DEBUG_MAGIC  0xDEADBEEFULL
+
+struct sg_table;
+
+void nvidia_p2p_debug_dump_addresses(uint64_t gpu_va,
+        struct nvidia_p2p_page_table *page_table, const char *tag);
+
+int nvidia_p2p_build_sg_table_phys(struct nvidia_p2p_page_table *page_table,
+        struct sg_table *sgt);
+
 #endif /* _NV_P2P_H_ */
