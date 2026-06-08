@@ -1025,3 +1025,83 @@ void nvidia_p2p_put_rsync_registers(
 }
 
 NV_EXPORT_SYMBOL(nvidia_p2p_put_rsync_registers);
+
+/*
+ * Scheme-A helpers: expose GPU VA -> PA/BAR/DMA (physical) for non-PCI peers.
+ * DMA address equals physical_address; no pci_dev dma_map_pages required.
+ */
+void nvidia_p2p_debug_dump_addresses(
+    uint64_t gpu_va,
+    struct nvidia_p2p_page_table *page_table,
+    const char *tag
+)
+{
+    NvU32 i;
+    NvU64 page_size;
+    NvU64 va_offset = 0;
+
+    if (page_table == NULL || tag == NULL)
+        return;
+
+    if (page_table->page_size >= NVIDIA_P2P_PAGE_SIZE_COUNT)
+        return;
+
+    page_size = nvidia_p2p_page_size_mappings[page_table->page_size];
+
+    printk(KERN_INFO
+        "NV_P2P_DEBUG magic=0x%08llx tag=%s gpu_va=0x%llx entries=%u page_size=%llu flags=0x%x\n",
+        (NvU64)NVIDIA_P2P_DEBUG_MAGIC, tag, gpu_va, page_table->entries,
+        page_size, page_table->flags);
+
+    for (i = 0; i < page_table->entries; i++)
+    {
+        NvU64 pa = page_table->pages[i]->physical_address;
+        NvU64 bar = pa;
+        NvU64 dma = pa;
+        NvU64 wreqmb = page_table->pages[i]->registers.fermi.wreqmb_h;
+        NvU64 rreqmb = page_table->pages[i]->registers.fermi.rreqmb_h;
+
+        printk(KERN_INFO
+            "NV_P2P_DEBUG magic=0x%08llx [%u] va=0x%llx pa=0x%llx bar=0x%llx dma=0x%llx "
+            "wreqmb_h=0x%x rreqmb_h=0x%x pattern=0x%08llx\n",
+            (NvU64)NVIDIA_P2P_DEBUG_MAGIC, i, gpu_va + va_offset, pa, bar, dma,
+            (NvU32)wreqmb, (NvU32)rreqmb,
+            (NvU64)(NVIDIA_P2P_DEBUG_MAGIC ^ (NvU64)i ^ pa));
+
+        va_offset += page_size;
+    }
+}
+NV_EXPORT_SYMBOL(nvidia_p2p_debug_dump_addresses);
+
+int nvidia_p2p_build_sg_table_phys(
+    struct nvidia_p2p_page_table *page_table,
+    struct sg_table *sgt
+)
+{
+    struct scatterlist *sg;
+    NvU32 i;
+    NvU64 page_size;
+    int ret;
+
+    if (page_table == NULL || sgt == NULL)
+        return -EINVAL;
+
+    if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
+        return -EINVAL;
+
+    page_size = nvidia_p2p_page_size_mappings[page_table->page_size];
+
+    ret = sg_alloc_table(sgt, page_table->entries, GFP_KERNEL);
+    if (ret)
+        return ret;
+
+    for_each_sg(sgt->sgl, sg, page_table->entries, i)
+    {
+        sg_set_page(sg, NULL, page_size, 0);
+        sg_dma_address(sg) = page_table->pages[i]->physical_address;
+        sg_dma_len(sg) = page_size;
+    }
+
+    return 0;
+}
+NV_EXPORT_SYMBOL(nvidia_p2p_build_sg_table_phys);
