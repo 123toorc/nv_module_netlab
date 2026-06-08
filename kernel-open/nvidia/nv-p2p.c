@@ -1027,51 +1027,77 @@ void nvidia_p2p_put_rsync_registers(
 NV_EXPORT_SYMBOL(nvidia_p2p_put_rsync_registers);
 
 /*
- * Scheme-A helpers: expose GPU VA -> PA/BAR/DMA (physical) for non-PCI peers.
- * DMA address equals physical_address; no pci_dev dma_map_pages required.
+ * Scheme-A helpers for URMA: physical_address as DMA, page0 test via NV.
  */
-void nvidia_p2p_debug_dump_addresses(
+static int nvidia_p2p_test_page0_access(
     uint64_t gpu_va,
     struct nvidia_p2p_page_table *page_table,
-    const char *tag
+    uint64_t *value,
+    NvBool write
 )
 {
-    NvU32 i;
-    NvU64 page_size;
-    NvU64 va_offset = 0;
+    NvU64 pa;
+    void *ptr;
 
-    if (page_table == NULL || tag == NULL)
-        return;
+    if (page_table == NULL || page_table->entries == 0 || value == NULL)
+        return -EINVAL;
 
-    if (page_table->page_size >= NVIDIA_P2P_PAGE_SIZE_COUNT)
-        return;
+    if (!(page_table->flags & NVIDIA_P2P_PAGE_TABLE_FLAGS_CPU_CACHEABLE))
+        return -EOPNOTSUPP;
 
-    page_size = nvidia_p2p_page_size_mappings[page_table->page_size];
+    pa = page_table->pages[0]->physical_address;
+    ptr = memremap((resource_size_t)pa, sizeof(NvU64), MEMREMAP_WB);
+    if (ptr == NULL)
+        return -ENOMEM;
 
-    printk(KERN_INFO
-        "NV_P2P_DEBUG magic=0x%08llx tag=%s gpu_va=0x%llx entries=%u page_size=%llu flags=0x%x\n",
-        (NvU64)NVIDIA_P2P_DEBUG_MAGIC, tag, gpu_va, page_table->entries,
-        page_size, page_table->flags);
+    if (write)
+        *(NvU64 *)ptr = *value;
+    else
+        *value = *(NvU64 *)ptr;
 
-    for (i = 0; i < page_table->entries; i++)
-    {
-        NvU64 pa = page_table->pages[i]->physical_address;
-        NvU64 bar = pa;
-        NvU64 dma = pa;
-        NvU64 wreqmb = page_table->pages[i]->registers.fermi.wreqmb_h;
-        NvU64 rreqmb = page_table->pages[i]->registers.fermi.rreqmb_h;
+    memunmap(ptr);
 
-        printk(KERN_INFO
-            "NV_P2P_DEBUG magic=0x%08llx [%u] va=0x%llx pa=0x%llx bar=0x%llx dma=0x%llx "
-            "wreqmb_h=0x%x rreqmb_h=0x%x pattern=0x%08llx\n",
-            (NvU64)NVIDIA_P2P_DEBUG_MAGIC, i, gpu_va + va_offset, pa, bar, dma,
-            (NvU32)wreqmb, (NvU32)rreqmb,
-            (NvU64)(NVIDIA_P2P_DEBUG_MAGIC ^ (NvU64)i ^ pa));
-
-        va_offset += page_size;
-    }
+    printk(KERN_INFO "nv_p2p_test: %s page0 gpu_va=0x%llx pa=0x%llx val=0x%llx\n",
+           write ? "gpu_write" : "gpu_read", gpu_va, pa, *value);
+    return 0;
 }
-NV_EXPORT_SYMBOL(nvidia_p2p_debug_dump_addresses);
+
+int nvidia_p2p_test_gpu_write_page0(
+    uint64_t gpu_va,
+    struct nvidia_p2p_page_table *page_table,
+    uint64_t value
+)
+{
+    return nvidia_p2p_test_page0_access(gpu_va, page_table, &value, NV_TRUE);
+}
+NV_EXPORT_SYMBOL(nvidia_p2p_test_gpu_write_page0);
+
+int nvidia_p2p_test_gpu_read_page0(
+    uint64_t gpu_va,
+    struct nvidia_p2p_page_table *page_table,
+    uint64_t *value
+)
+{
+    return nvidia_p2p_test_page0_access(gpu_va, page_table, value, NV_FALSE);
+}
+NV_EXPORT_SYMBOL(nvidia_p2p_test_gpu_read_page0);
+
+int nvidia_p2p_test_phys_store_u64(uint64_t phys_addr, uint64_t value)
+{
+    void *ptr;
+
+    ptr = memremap((resource_size_t)phys_addr, sizeof(value), MEMREMAP_WB);
+    if (ptr == NULL)
+        return -ENOMEM;
+
+    *(NvU64 *)ptr = value;
+    memunmap(ptr);
+
+    printk(KERN_INFO "nv_p2p_test: phys_store pa=0x%llx val=0x%llx\n",
+           phys_addr, value);
+    return 0;
+}
+NV_EXPORT_SYMBOL(nvidia_p2p_test_phys_store_u64);
 
 int nvidia_p2p_build_sg_table_phys(
     struct nvidia_p2p_page_table *page_table,
