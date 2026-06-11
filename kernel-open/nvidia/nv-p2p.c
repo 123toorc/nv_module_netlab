@@ -1097,7 +1097,9 @@ int nvidia_p2p_build_sg_table_phys(
 
     for_each_sg(sgt->sgl, sg, page_table->entries, i)
     {
-        sg_set_page(sg, NULL, page_size, 0);
+        //sg_set_page(sg, NULL, page_size, 0);
+        sg->offset = 0;
+        sg->length = page_size;
         sg_dma_address(sg) = page_table->pages[i]->physical_address;
         sg_dma_len(sg) = page_size;
     }
