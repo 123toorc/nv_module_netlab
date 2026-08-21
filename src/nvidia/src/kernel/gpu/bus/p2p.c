@@ -34,6 +34,13 @@
 #include "gpu/bus/third_party_p2p.h"
 #include "gpu/device/device.h"
 #include "rmapi/rs_utils.h"
+#include "rmapi/rmapi.h"
+#include "rmapi/client.h"
+#include "rmapi/mapping_list.h"
+#include "mem_mgr/mem.h"
+#include "mem_mgr/virtual_mem.h"
+#include "gpu/mem_mgr/mem_desc.h"
+#include "containers/btree.h"
 #include "vgpu/rpc.h"
 #include "vgpu/vgpu_events.h"
 #include "gpu/bus/kern_bus.h"
@@ -837,6 +844,597 @@ NV_STATUS RmP2PValidateAddressRangeOrGetPages
     return NV_OK;
 }
 
+//
+// GeForce / consumer CUDA never sends NV503C REGISTER_VA_SPACE / REGISTER_VIDMEM.
+// nvidia_p2p_get_pages() then fails with NV_ERR_OBJECT_NOT_FOUND (0x57) even
+// though a ThirdPartyP2P object exists (often the MemoryManager internal one).
+// Restore the old GPU-VA reverse lookup as a lazy registration fallback.
+//
+static NvBool
+_rmP2PIsInternalClient(OBJGPU *pGpu, NvHandle hClient)
+{
+    MemoryManager *pMemoryManager;
+
+    if (pGpu == NULL)
+        return NV_FALSE;
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    return (pMemoryManager != NULL) && (pMemoryManager->hClient == hClient);
+}
+
+static NvBool
+_rmP2PIsInternalObject(ThirdPartyP2P *pThirdPartyP2P)
+{
+    return _rmP2PIsInternalClient(GPU_RES_GET_GPU(pThirdPartyP2P),
+                                  pThirdPartyP2P->hClient);
+}
+
+static void
+_rmP2PDumpThirdPartyP2PInventory(NvU32 pid, NvU64 address, NvU64 length)
+{
+    RS_SHARE_ITERATOR it = serverutilShareIter(classId(P2PTokenShare));
+    NvU32 count = 0;
+
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P inventory pid=%u address=0x%llx length=0x%llx\n",
+              pid, address, length);
+
+    while (serverutilShareIterNext(&it))
+    {
+        P2PTokenShare *pShare = dynamicCast(it.pShared, P2PTokenShare);
+        ThirdPartyP2P *pThirdPartyP2P;
+        OBJGPU *pGpu;
+        NvU32 vasCount = 0;
+        NvU32 vidCount = 0;
+        CLI_THIRD_PARTY_P2P_VASPACE_INFO_MAPIter vasIt;
+        CLI_THIRD_PARTY_P2P_VIDMEM_INFO_MAPIter vidIt;
+
+        if (pShare == NULL)
+            continue;
+
+        pThirdPartyP2P = pShare->pThirdPartyP2P;
+        if (pThirdPartyP2P == NULL)
+            continue;
+
+        pGpu = GPU_RES_GET_GPU(pThirdPartyP2P);
+        vasIt = mapIterAll(&pThirdPartyP2P->vaSpaceInfoMap);
+        while (mapIterNext(&vasIt))
+            vasCount++;
+        vidIt = mapIterAll(&pThirdPartyP2P->vidmemInfoMap);
+        while (mapIterNext(&vidIt))
+            vidCount++;
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "GDRP2P  tpp[%u] hClient=0x%x hTPP=0x%x type=%u token=0x%llx "
+                  "internal=%u pidMatch=%u vas=%u vidmem=%u gpu=%u\n",
+                  count,
+                  pThirdPartyP2P->hClient,
+                  pThirdPartyP2P->hThirdPartyP2P,
+                  pThirdPartyP2P->type,
+                  pThirdPartyP2P->p2pToken,
+                  _rmP2PIsInternalObject(pThirdPartyP2P),
+                  thirdpartyp2pIsValidClientPid(pThirdPartyP2P, pid, 0),
+                  vasCount,
+                  vidCount,
+                  (pGpu != NULL) ? gpuGetInstance(pGpu) : 0xffffffffU);
+        count++;
+    }
+
+    NV_PRINTF(LEVEL_ERROR, "GDRP2P inventory count=%u\n", count);
+}
+
+static void
+_rmP2PDumpUserFbAllocs(NvU32 pid, OBJGPU *pGpu, NvU64 length)
+{
+    RmClient **ppClient;
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient *pRmClient = *ppClient;
+        RsClient *pClient = staticCast(pRmClient, RsClient);
+        Device *pDevice = NULL;
+        NODE *pNode;
+
+        if (pRmClient->ProcID != pid)
+            continue;
+
+        if (pGpu != NULL)
+        {
+            if (_rmP2PIsInternalClient(pGpu, pClient->hClient))
+                continue;
+            if (deviceGetByGpu(pClient, pGpu, NV_TRUE, &pDevice) != NV_OK)
+                continue;
+        }
+        else
+        {
+            RS_ITERATOR it = clientRefIter(pClient, NULL, classId(Device),
+                                           RS_ITERATE_CHILDREN, NV_TRUE);
+            if (!clientRefIterNext(pClient, &it))
+                continue;
+            pDevice = dynamicCast(it.pResourceRef->pResource, Device);
+        }
+
+        if (pDevice == NULL)
+            continue;
+
+        btreeEnumStart(0, &pNode, pDevice->DevMemoryTable);
+        while (pNode != NULL)
+        {
+            Memory *pMemory = pNode->Data;
+            NvU64 memSize;
+
+            btreeEnumNext(&pNode, pDevice->DevMemoryTable);
+            if ((pMemory == NULL) || (pMemory->pMemDesc == NULL))
+                continue;
+            if (dynamicCast(pMemory, VirtualMemory) != NULL)
+                continue;
+            if (memdescGetAddressSpace(pMemory->pMemDesc) != ADDR_FBMEM)
+                continue;
+
+            memSize = memdescGetSize(pMemory->pMemDesc);
+            NV_PRINTF(LEVEL_ERROR,
+                      "GDRP2P  fbmem hClient=0x%x hMemory=0x%x size=0x%llx need=0x%llx exact=%u\n",
+                      pClient->hClient,
+                      RES_GET_HANDLE(pMemory),
+                      memSize,
+                      length,
+                      (memSize == length));
+        }
+    }
+}
+
+static Memory *
+_rmP2PFindMemoryForMemDesc(Device *pDevice, MEMORY_DESCRIPTOR *pTarget)
+{
+    MEMORY_DESCRIPTOR *pRoot;
+    NODE *pNode;
+
+    if ((pDevice == NULL) || (pTarget == NULL))
+        return NULL;
+
+    pRoot = memdescGetRootMemDesc(pTarget, NULL);
+
+    btreeEnumStart(0, &pNode, pDevice->DevMemoryTable);
+    while (pNode != NULL)
+    {
+        Memory *pMemory = pNode->Data;
+
+        btreeEnumNext(&pNode, pDevice->DevMemoryTable);
+        if ((pMemory == NULL) || (pMemory->pMemDesc == NULL))
+            continue;
+        if (dynamicCast(pMemory, VirtualMemory) != NULL)
+            continue;
+        if ((pMemory->pMemDesc == pTarget) || (pMemory->pMemDesc == pRoot))
+            return pMemory;
+        if (memdescGetRootMemDesc(pMemory->pMemDesc, NULL) == pRoot)
+            return pMemory;
+    }
+
+    return NULL;
+}
+
+static NV_STATUS
+_rmP2PFindUserVidmemForAddress
+(
+    OBJGPU    *pGpu,
+    NvU64      address,
+    NvU64      length,
+    RsClient **ppMemClient,
+    Memory   **ppMemory,
+    NvU64     *pOffset,
+    NvHandle  *phVASpace
+)
+{
+    RmClient **ppClient;
+    NvU32 pid = osGetCurrentProcess();
+    Memory *pExact = NULL;
+    RsClient *pExactClient = NULL;
+    NvU32 exactCount = 0;
+    Memory *pBest = NULL;
+    RsClient *pBestClient = NULL;
+    NvU64 bestSize = ~((NvU64)0);
+    NvU32 bestCount = 0;
+
+    NV_ASSERT_OR_RETURN(ppMemClient != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(ppMemory != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(pOffset != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(phVASpace != NULL, NV_ERR_INVALID_ARGUMENT);
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient *pRmClient = *ppClient;
+        RsClient *pClient = staticCast(pRmClient, RsClient);
+        Device *pDevice = NULL;
+        NODE *pNode;
+
+        if (pRmClient->ProcID != pid)
+            continue;
+
+        if (pGpu != NULL)
+        {
+            if (_rmP2PIsInternalClient(pGpu, pClient->hClient))
+                continue;
+            if (deviceGetByGpu(pClient, pGpu, NV_TRUE, &pDevice) != NV_OK)
+                continue;
+        }
+        else
+        {
+            RS_ITERATOR it = clientRefIter(pClient, NULL, classId(Device),
+                                           RS_ITERATE_CHILDREN, NV_TRUE);
+            if (!clientRefIterNext(pClient, &it))
+                continue;
+            pDevice = dynamicCast(it.pResourceRef->pResource, Device);
+        }
+
+        if (pDevice == NULL)
+            continue;
+
+        btreeEnumStart(0, &pNode, pDevice->DevMemoryTable);
+        while (pNode != NULL)
+        {
+            Memory *pMemory = pNode->Data;
+            VirtualMemory *pVirt;
+            NODE *pMapNode;
+
+            btreeEnumNext(&pNode, pDevice->DevMemoryTable);
+            if (pMemory == NULL)
+                continue;
+
+            pVirt = dynamicCast(pMemory, VirtualMemory);
+            if ((pVirt == NULL) || (pVirt->pDmaMappingList == NULL))
+                continue;
+
+            if (btreeSearch(address, &pMapNode, pVirt->pDmaMappingList) == NV_OK)
+            {
+                CLI_DMA_MAPPING_INFO *pDma = pMapNode->Data;
+                Memory *pPhysMem;
+                NvU64 rootOffset = 0;
+                NvU64 mapVa;
+                NvU64 offset;
+
+                if ((pDma == NULL) || (pDma->pMemDesc == NULL))
+                    continue;
+                if (memdescGetAddressSpace(pDma->pMemDesc) != ADDR_FBMEM)
+                    continue;
+
+                mapVa = (pDma->DmaOffset != 0) ? pDma->DmaOffset : pMapNode->keyStart;
+                if (address < mapVa)
+                    continue;
+
+                memdescGetRootMemDesc(pDma->pMemDesc, &rootOffset);
+                offset = rootOffset + (address - mapVa);
+
+                pPhysMem = _rmP2PFindMemoryForMemDesc(pDevice, pDma->pMemDesc);
+                if ((pPhysMem == NULL) || (pPhysMem->pMemDesc == NULL))
+                    continue;
+                if ((offset + length) > memdescGetSize(pPhysMem->pMemDesc))
+                    continue;
+
+                NV_PRINTF(LEVEL_ERROR,
+                          "GDRP2P matched DMA map va=0x%llx dmaOff=0x%llx hVASpace=0x%x hMemory=0x%x\n",
+                          address, mapVa, pVirt->hVASpace, RES_GET_HANDLE(pPhysMem));
+
+                *ppMemClient = pClient;
+                *ppMemory = pPhysMem;
+                *pOffset = offset;
+                *phVASpace = pVirt->hVASpace;
+                return NV_OK;
+            }
+        }
+
+        btreeEnumStart(0, &pNode, pDevice->DevMemoryTable);
+        while (pNode != NULL)
+        {
+            Memory *pMemory = pNode->Data;
+            NvU64 memSize;
+
+            btreeEnumNext(&pNode, pDevice->DevMemoryTable);
+            if ((pMemory == NULL) || (pMemory->pMemDesc == NULL))
+                continue;
+            if (dynamicCast(pMemory, VirtualMemory) != NULL)
+                continue;
+            if (memdescGetAddressSpace(pMemory->pMemDesc) != ADDR_FBMEM)
+                continue;
+
+            memSize = memdescGetSize(pMemory->pMemDesc);
+            if (memSize == length)
+            {
+                exactCount++;
+                pExact = pMemory;
+                pExactClient = pClient;
+            }
+            if (memSize >= length)
+            {
+                if (memSize < bestSize)
+                {
+                    bestSize = memSize;
+                    pBest = pMemory;
+                    pBestClient = pClient;
+                    bestCount = 1;
+                }
+                else if (memSize == bestSize)
+                {
+                    bestCount++;
+                }
+            }
+        }
+    }
+
+    if (exactCount == 1)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "GDRP2P matched unique FB size=0x%llx hMemory=0x%x\n",
+                  length, RES_GET_HANDLE(pExact));
+        *ppMemClient = pExactClient;
+        *ppMemory = pExact;
+        *pOffset = 0;
+        *phVASpace = 0;
+        return NV_OK;
+    }
+
+    if (bestCount == 1)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "GDRP2P matched unique min FB size=0x%llx (>=0x%llx) hMemory=0x%x\n",
+                  bestSize, length, RES_GET_HANDLE(pBest));
+        *ppMemClient = pBestClient;
+        *ppMemory = pBest;
+        *pOffset = 0;
+        *phVASpace = 0;
+        return NV_OK;
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P no RM DMA mapping for va=0x%llx; exact=%u min-ge=%u\n",
+              address, exactCount, bestCount);
+    return NV_ERR_OBJECT_NOT_FOUND;
+}
+
+static NV_STATUS
+_rmP2PEnsureVaSpace(ThirdPartyP2P *pThirdPartyP2P, NvHandle hVASpace)
+{
+    PCLI_THIRD_PARTY_P2P_VASPACE_INFO pInfo = NULL;
+    NvU32 token = 0;
+    NV_STATUS status;
+
+    if (thirdpartyp2pGetNextVASpaceInfo(pThirdPartyP2P, &pInfo) == NV_OK)
+        return NV_OK;
+
+    status = CliAddThirdPartyP2PVASpace(pThirdPartyP2P, hVASpace, &token);
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P lazy REGISTER_VA_SPACE hVASpace=0x%x token=0x%x status=0x%x\n",
+              hVASpace, token, status);
+    return status;
+}
+
+static NV_STATUS
+_rmP2PRegisterFoundVidmem
+(
+    ThirdPartyP2P *pThirdPartyP2P,
+    RsClient      *pMemClient,
+    Memory        *pMemory,
+    NvU64          address,
+    NvU64          length,
+    NvU64          offset
+)
+{
+    RsClient *pTppClient = RES_GET_CLIENT(pThirdPartyP2P);
+    Memory *pRegMemory = pMemory;
+    NvHandle hMemory = RES_GET_HANDLE(pMemory);
+    NV_STATUS status;
+
+    if (pMemClient->hClient != pTppClient->hClient)
+    {
+        RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+        Device *pDevice = GPU_RES_GET_DEVICE(pThirdPartyP2P);
+        Subdevice *pSubdevice = GPU_RES_GET_SUBDEVICE(pThirdPartyP2P);
+        NvHandle hDuped = 0;
+
+        status = pRmApi->DupObject(pRmApi,
+                                   pTppClient->hClient,
+                                   RES_GET_HANDLE(pDevice),
+                                   &hDuped,
+                                   pMemClient->hClient,
+                                   hMemory,
+                                   0);
+        if ((status == NV_ERR_INVALID_OBJECT_PARENT) && (pSubdevice != NULL))
+        {
+            status = pRmApi->DupObject(pRmApi,
+                                       pTppClient->hClient,
+                                       RES_GET_HANDLE(pSubdevice),
+                                       &hDuped,
+                                       pMemClient->hClient,
+                                       hMemory,
+                                       0);
+        }
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "GDRP2P dup hMemory=0x%x into tpp client=0x%x failed 0x%x\n",
+                      hMemory, pTppClient->hClient, status);
+            return status;
+        }
+
+        status = memGetByHandleAndDevice(pTppClient, hDuped,
+                                         RES_GET_HANDLE(pDevice), &pRegMemory);
+        if (status != NV_OK)
+        {
+            pRmApi->Free(pRmApi, pTppClient->hClient, hDuped);
+            return status;
+        }
+        hMemory = hDuped;
+    }
+
+    if ((pRegMemory == NULL) || (pRegMemory->pMemDesc == NULL))
+        return NV_ERR_INVALID_OBJECT;
+
+    if ((offset + length) > memdescGetSize(pRegMemory->pMemDesc))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if ((address | length | offset) & (NVRM_P2P_PAGESIZE_BIG_64K - 1))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    status = CliAddThirdPartyP2PVidmemInfo(pThirdPartyP2P, hMemory,
+                                           address, length, offset, pRegMemory);
+    if (status == NV_ERR_INSERT_DUPLICATE_NAME)
+        status = NV_OK;
+
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P lazy REGISTER_VIDMEM hMemory=0x%x addr=0x%llx size=0x%llx off=0x%llx status=0x%x\n",
+              hMemory, address, length, offset, status);
+    return status;
+}
+
+static NV_STATUS
+RmP2PLazyRegisterVidmem
+(
+    ThirdPartyP2P *pThirdPartyP2P,
+    NvU64          address,
+    NvU64          length
+)
+{
+    OBJGPU *pGpu = GPU_RES_GET_GPU(pThirdPartyP2P);
+    RsClient *pMemClient = NULL;
+    Memory *pMemory = NULL;
+    CLI_THIRD_PARTY_P2P_VIDMEM_INFO *pVidmemInfo = NULL;
+    NvU64 offset = 0;
+    NvHandle hVASpace = 0;
+    NV_STATUS status;
+
+    if (CliGetThirdPartyP2PVidmemInfoFromAddress(pThirdPartyP2P, address, length,
+                                                 &offset, &pVidmemInfo) == NV_OK)
+    {
+        return _rmP2PEnsureVaSpace(pThirdPartyP2P, 0);
+    }
+
+    status = _rmP2PFindUserVidmemForAddress(pGpu, address, length,
+                                            &pMemClient, &pMemory, &offset, &hVASpace);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "GDRP2P lazy find failed status=0x%x va=0x%llx len=0x%llx tpp=0x%x\n",
+                  status, address, length, pThirdPartyP2P->hThirdPartyP2P);
+        return status;
+    }
+
+    status = _rmP2PRegisterFoundVidmem(pThirdPartyP2P, pMemClient, pMemory,
+                                       address, length, offset);
+    if (status != NV_OK)
+        return status;
+
+    return _rmP2PEnsureVaSpace(pThirdPartyP2P, hVASpace);
+}
+
+static NV_STATUS
+_rmP2PFindUserClientForGpu(OBJGPU *pGpu, NvU32 pid, NvHandle *phClient)
+{
+    RmClient **ppClient;
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient *pRmClient = *ppClient;
+        RsClient *pClient = staticCast(pRmClient, RsClient);
+        Device *pDevice = NULL;
+
+        if (pRmClient->ProcID != pid)
+            continue;
+
+        if (pGpu != NULL)
+        {
+            if (_rmP2PIsInternalClient(pGpu, pClient->hClient))
+                continue;
+            if (deviceGetByGpu(pClient, pGpu, NV_TRUE, &pDevice) != NV_OK)
+                continue;
+        }
+
+        *phClient = pClient->hClient;
+        return NV_OK;
+    }
+
+    return NV_ERR_OBJECT_NOT_FOUND;
+}
+
+static NV_STATUS
+RmP2PAttachPidToInternalAndRegister
+(
+    NvU64   address,
+    NvU64   length,
+    OBJGPU *pGpu
+)
+{
+    NvU32 pid = osGetCurrentProcess();
+    RS_SHARE_ITERATOR it;
+    NvHandle hUserClient = 0;
+    ThirdPartyP2P *pUserTpp = NULL;
+    ThirdPartyP2P *pInternalTpp = NULL;
+    ThirdPartyP2P *pTarget;
+    NV_STATUS status;
+
+    status = _rmP2PFindUserClientForGpu(pGpu, pid, &hUserClient);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "GDRP2P no user RM client for pid=%u\n", pid);
+        return status;
+    }
+
+    it = serverutilShareIter(classId(P2PTokenShare));
+    while (serverutilShareIterNext(&it))
+    {
+        P2PTokenShare *pShare = dynamicCast(it.pShared, P2PTokenShare);
+        ThirdPartyP2P *pThirdPartyP2P;
+        OBJGPU *pTppGpu;
+
+        if (pShare == NULL)
+            continue;
+
+        pThirdPartyP2P = pShare->pThirdPartyP2P;
+        if (pThirdPartyP2P == NULL)
+            continue;
+
+        pTppGpu = GPU_RES_GET_GPU(pThirdPartyP2P);
+        if ((pGpu != NULL) && (pTppGpu != pGpu))
+            continue;
+
+        if (_rmP2PIsInternalObject(pThirdPartyP2P))
+        {
+            if (pInternalTpp == NULL)
+                pInternalTpp = pThirdPartyP2P;
+        }
+        else if (thirdpartyp2pIsValidClientPid(pThirdPartyP2P, pid, 0) ||
+                 (pThirdPartyP2P->hClient == hUserClient))
+        {
+            if (pUserTpp == NULL)
+                pUserTpp = pThirdPartyP2P;
+        }
+    }
+
+    pTarget = (pUserTpp != NULL) ? pUserTpp : pInternalTpp;
+    if (pTarget == NULL)
+    {
+        NV_PRINTF(LEVEL_ERROR, "GDRP2P no ThirdPartyP2P object to lazy-register\n");
+        return NV_ERR_OBJECT_NOT_FOUND;
+    }
+
+    if (!thirdpartyp2pIsValidClientPid(pTarget, pid, 0))
+    {
+        status = CliAddThirdPartyP2PClientPid(pTarget, pid, hUserClient);
+        NV_PRINTF(LEVEL_ERROR,
+                  "GDRP2P attach pid=%u hClient=0x%x to tpp=0x%x internal=%u status=0x%x\n",
+                  pid, hUserClient, pTarget->hThirdPartyP2P,
+                  _rmP2PIsInternalObject(pTarget), status);
+        if (status != NV_OK)
+            return status;
+    }
+
+    return RmP2PLazyRegisterVidmem(pTarget, address, length);
+}
+
 static
 NV_STATUS RmP2PGetVASpaceInfoWithoutToken
 (
@@ -923,8 +1521,10 @@ NV_STATUS RmP2PGetInfoWithoutToken
     PCLI_THIRD_PARTY_P2P_INFO pThirdPartyP2PInfo = NULL;
     PCLI_THIRD_PARTY_P2P_VASPACE_INFO pVASpaceInfo = NULL;
     NvBool bFound = NV_FALSE;
+    NvBool bLazyTried = NV_FALSE;
     NvU32 processId = osGetCurrentProcess();
 
+retry:
     while (1)
     {
         RmClient *pClient;
@@ -986,6 +1586,20 @@ NV_STATUS RmP2PGetInfoWithoutToken
                 }
             }
         }
+    }
+
+    if ((status != NV_OK) && !bLazyTried && (length != 0))
+    {
+        bLazyTried = NV_TRUE;
+        _rmP2PDumpThirdPartyP2PInventory(processId, address, length);
+        if (RmP2PAttachPidToInternalAndRegister(address, length, pGpu) == NV_OK)
+        {
+            pThirdPartyP2PInfo = NULL;
+            pVASpaceInfo = NULL;
+            bFound = NV_FALSE;
+            goto retry;
+        }
+        _rmP2PDumpUserFbAllocs(processId, pGpu, length);
     }
 
     return status;

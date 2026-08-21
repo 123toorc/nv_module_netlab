@@ -501,6 +501,9 @@ static int nv_p2p_get_pages(
                                      &gpu_uuid, &gpu_info);
         if (status != NV_OK)
         {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: rm_p2p_get_gpu_info status=0x%x va=0x%llx len=0x%llx\n",
+                      status, virtual_address, length);
             goto failed;
         }
 
@@ -524,6 +527,9 @@ static int nv_p2p_get_pages(
                                              &mem_info->mig_info, &cpu_cacheable);
         if (status != NV_OK)
         {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: rm_p2p_get_pages_persistent status=0x%x va=0x%llx len=0x%llx\n",
+                      status, virtual_address, length);
             goto failed;
         }
     }
@@ -535,6 +541,9 @@ static int nv_p2p_get_pages(
                 rreqmb_h, &entries, &gpu_uuid, *page_table, &cpu_cacheable);
         if (status != NV_OK)
         {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: rm_p2p_get_pages status=0x%x va=0x%llx len=0x%llx token=0x%llx\n",
+                      status, virtual_address, length, p2p_token);
             goto failed;
         }
 

@@ -171,6 +171,11 @@ thirdpartyp2pConstruct_IMPL
     pP2PTokenShare->pThirdPartyP2P = pThirdPartyP2P;
     pThirdPartyP2P->pTokenShare = pP2PTokenShare;
 
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P Construct hClient=0x%x hTPP=0x%x pid=%u type=%u token=0x%llx gpu=%u\n",
+              hClient, hThirdPartyP2P, pid, type, p2pToken,
+              gpuGetInstance(pGpu));
+
     NV_ASSERT(status == NV_OK);
     return status;
 }
