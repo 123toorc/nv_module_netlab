@@ -38,7 +38,7 @@ thirdpartyp2pCtrlCmdRegisterVaSpace_IMPL
     NV503C_CTRL_REGISTER_VA_SPACE_PARAMS *pRegisterVaSpaceParams
 )
 {
-    NvU32     vaSpaceToken;
+    NvU32     vaSpaceToken = 0;
     NV_STATUS status;
     OBJGPU *pGpu;
 
@@ -56,6 +56,10 @@ thirdpartyp2pCtrlCmdRegisterVaSpace_IMPL
             pRegisterVaSpaceParams->vaSpaceToken = vaSpaceToken;
         }
     }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P RegisterVaSpace hVASpace=0x%x token=0x%x status=0x%x\n",
+              pRegisterVaSpaceParams->hVASpace, vaSpaceToken, status);
 
     return status;
 }
@@ -141,6 +145,11 @@ thirdpartyp2pCtrlCmdRegisterVidmem_IMPL
                                            size,
                                            offset,
                                            pMemory);
+
+    NV_PRINTF(LEVEL_ERROR,
+              "GDRP2P RegisterVidmem hMemory=0x%x addr=0x%llx size=0x%llx off=0x%llx status=0x%x\n",
+              pRegisterVidmemParams->hMemory, address, size, offset, status);
+
     if (status != NV_OK)
     {
         return status;
