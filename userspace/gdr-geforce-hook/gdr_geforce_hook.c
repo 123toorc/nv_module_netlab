@@ -558,6 +558,17 @@ static vmm_alloc_t *take_vmm(CUdeviceptr va)
     return NULL;
 }
 
+static int owns_va_locked(CUdeviceptr ptr)
+{
+    vmm_alloc_t *n;
+
+    for (n = vmm_list; n; n = n->next) {
+        if (ptr >= n->va && ptr < n->va + n->size)
+            return 1;
+    }
+    return 0;
+}
+
 static void *load_cuda_sym(const char *name)
 {
     void *h;
@@ -624,11 +635,17 @@ static CUresult vmm_alloc_and_register(CUdeviceptr *dptr, size_t bytesize)
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = (int)dev;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
 
     r = real_cuMemGetAllocationGranularity(&gran, &prop,
                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-    if (r != CUDA_SUCCESS)
-        return r;
+    if (r != CUDA_SUCCESS) {
+        prop.allocFlags.gpuDirectRDMACapable = 0;
+        r = real_cuMemGetAllocationGranularity(&gran, &prop,
+                                               CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (r != CUDA_SUCCESS)
+            return r;
+    }
     if (gran < GDR_PAGE)
         gran = GDR_PAGE;
 
@@ -643,6 +660,11 @@ static CUresult vmm_alloc_and_register(CUdeviceptr *dptr, size_t bytesize)
     pthread_mutex_unlock(&lock);
 
     r = real_cuMemCreate(&phys, alloc_sz, &prop, 0);
+    if (r != CUDA_SUCCESS && prop.allocFlags.gpuDirectRDMACapable) {
+        logmsg("cuMemCreate RDMA-capable failed (%d), retry without flag\n", r);
+        prop.allocFlags.gpuDirectRDMACapable = 0;
+        r = real_cuMemCreate(&phys, alloc_sz, &prop, 0);
+    }
     if (r != CUDA_SUCCESS) {
         real_cuMemAddressFree(va, alloc_sz);
         pthread_mutex_lock(&lock);
@@ -674,8 +696,13 @@ static CUresult vmm_alloc_and_register(CUdeviceptr *dptr, size_t bytesize)
         return r;
     }
 
-    if (real_cuPointerSetAttribute)
-        real_cuPointerSetAttribute(&sync, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, va);
+    if (real_cuPointerSetAttribute) {
+        CUresult sync_r = real_cuPointerSetAttribute(&sync,
+                                                     CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, va);
+        if (sync_r != CUDA_SUCCESS)
+            logmsg("SYNC_MEMOPS on VMM va=0x%llx returned %d (ignored; GeForce)\n",
+                   (unsigned long long)va, sync_r);
+    }
 
     pthread_mutex_lock(&lock);
     register_vidmem_locked((uint64_t)va, (uint64_t)alloc_sz, hMemory);
@@ -723,6 +750,33 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
 CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytesize)
 {
     return cuMemAlloc_v2(dptr, bytesize);
+}
+
+CUresult cuPointerSetAttribute(const void *value, CUpointer_attribute attrib,
+                               CUdeviceptr ptr)
+{
+    CUresult r;
+    int owned;
+
+    resolve_cuda();
+    if (!real_cuPointerSetAttribute)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    r = real_cuPointerSetAttribute(value, attrib, ptr);
+    if (attrib != CU_POINTER_ATTRIBUTE_SYNC_MEMOPS)
+        return r;
+    if (r == CUDA_SUCCESS)
+        return r;
+
+    pthread_mutex_lock(&lock);
+    owned = owns_va_locked(ptr);
+    pthread_mutex_unlock(&lock);
+
+    logmsg("cuPointerSetAttribute(SYNC_MEMOPS) ptr=0x%llx -> %d%s\n",
+           (unsigned long long)ptr, r, owned ? " (owned VMM, return SUCCESS)" : "");
+    if (owned || r == CUDA_ERROR_NOT_SUPPORTED)
+        return CUDA_SUCCESS;
+    return r;
 }
 
 CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
