@@ -51,6 +51,11 @@ Success looks like:
 
 Then `gdr_pin_buffer` must not return `-22`.
 
+If `REGISTER_VIDMEM status=0x0` already printed but the test dies with
+`CUDA_ERROR_NOT_SUPPORTED` at `copylat.cpp` / `gpu_mem_alloc`, that is
+`cuPointerSetAttribute(SYNC_MEMOPS)` on the VMM pointer (GeForce rejects it).
+Rebuild this hook: it now intercepts that call and returns success so pin can run.
+
 ## If it still fails
 
 | Log | Meaning |
