@@ -1,20 +1,45 @@
 /*
- * LD_PRELOAD hook that makes GDRCopy work on GeForce / RTX 4090D.
+ * GeForce / RTX 4090D GDRCopy hook — libgdr_geforce_hook.so
  *
- * GeForce libcuda never sends REGISTER_VA_SPACE / REGISTER_VIDMEM, so
- * nvidia_p2p_get_pages() returns NV_ERR_OBJECT_NOT_FOUND (0x57) / -EINVAL.
+ * ---------------------------------------------------------------------------
+ * LD_PRELOAD 是怎么“绑架”符号的（动态链接，不是 patch libcuda）
+ * ---------------------------------------------------------------------------
  *
- * This library:
- *   1. Forces CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_* to 1
- *   2. Turns cuMemAlloc into VMM (cuMemCreate/cuMemMap) so RM has an hMemory
- *   3. Hooks ioctl() to steal CUDA's hClient/hDevice/hSubdevice/hVASpace/hMemory
- *   4. Allocates NV50_THIRD_PARTY_P2P (0x503c) once and registers each buffer
+ *   export LD_PRELOAD=$PWD/libgdr_geforce_hook.so
+ *   ./gdrcopy_copylat
  *
- * Do not change the NVIDIA kernel modules for this path. BAR1 P2P (aikitoria
- * 575.64.05-p2p) must already be loaded.
+ * 动态链接器（ld.so）加载顺序变成：
  *
- *   export LD_PRELOAD=/path/to/libgdr_geforce_hook.so
- *   ./copybw
+ *   1. 先加载本 .so
+ *   2. 再加载可执行文件依赖的 libc / libcuda.so.1 / libgdrapi
+ *
+ * 解析未定义符号时，从先加载的库开始搜。本文件导出了和 libc/libcuda
+ * 同名的全局函数：
+ *
+ *   ioctl, cuMemAlloc, cuMemAlloc_v2, cuDeviceGetAttribute, ...
+ *
+ * GDRCopy / libcuda 里的 `call ioctl` / `bl cuMemAlloc` 会先命中我们，
+ * 而不是原来的实现。这就是“绑架”：符号拦截，不改二进制文件偏移。
+ *
+ * 我们自己还要调用“真的”实现时，用 dlsym(RTLD_NEXT, "ioctl")：
+ * 从本 .so 之后的库继续搜，拿到 libc 的 ioctl、libcuda 的 cuMemCreate。
+ * 千万不要再调自己（否则递归死循环）。
+ *
+ * 绑不住的情况：对方用 syscall(SYS_ioctl) 而不是 libc ioctl()；
+ * 或者静态链接了 CUDA。当前 575 libcuda + GDRCopy 走的是动态符号。
+ *
+ * 这里没有写死你 GDB 里的 libcuda 地址（2a515c / 0x47d9d0 等）。
+ * 写死的是 RM 公开协议；hClient / hMemory / VA 运行时从 ioctl 里抓。
+ *
+ * ---------------------------------------------------------------------------
+ * 功能（GeForce libcuda 从不发 REGISTER_VIDMEM，get_pages 会 0x57）
+ * ---------------------------------------------------------------------------
+ *   1. cuDeviceGetAttribute(116/110) 强制返回 1
+ *   2. cuMemAlloc 改成 VMM，RM 里才有 class 0x40 的 hMemory
+ *   3. hook ioctl，记下 CUDA 的 hClient/hDevice/hSubdevice/hVASpace/hMemory
+ *   4. 自己 Alloc 0x503c + REGISTER_VA_SPACE + REGISTER_VIDMEM
+ *
+ * 内核仍用 aikitoria 575.64.05-p2p（GPU↔GPU BAR1 P2P）。本 hook 不管 BAR1 大小。
  */
 
 #define _GNU_SOURCE
@@ -30,19 +55,25 @@
 #include <unistd.h>
 
 /* -------------------------------------------------------------------------- */
-/* NVIDIA RM ioctl wire format (must match nvos.h / cl503c.h / ctrl503c.h)    */
-/* -------------------------------------------------------------------------- */
+/* NVIDIA RM ioctl 线规（公开头文件，不是 libcuda 反汇编地址）
+ *
+ * ioctl(fd, _IOWR('F', nr, struct), &packet)
+ *   nr=0x2B RM_ALLOC    新建对象，得到 handle
+ *   nr=0x2A RM_CONTROL  对已有对象发 cmd（例如 0x503c0104）
+ *
+ * class 用来认出 CUDA 正在建什么；handle 本身每次运行都不同。
+ * -------------------------------------------------------------------------- */
 
 #define NV_IOCTL_MAGIC              'F'
 #define NV_ESC_RM_ALLOC_OBJECT      0x28
 #define NV_ESC_RM_CONTROL           0x2A
 #define NV_ESC_RM_ALLOC             0x2B
 
-#define NV01_DEVICE_0               0x00000080u
-#define NV20_SUBDEVICE_0            0x00002080u
-#define FERMI_VASPACE_A             0x000090f1u
-#define NV50_THIRD_PARTY_P2P        0x0000503cu
-#define NV01_MEMORY_LOCAL_USER      0x00000040u
+#define NV01_DEVICE_0               0x00000080u  /* GPU device */
+#define NV20_SUBDEVICE_0            0x00002080u  /* 0x503c 的 parent */
+#define FERMI_VASPACE_A             0x000090f1u  /* GPU VA space */
+#define NV50_THIRD_PARTY_P2P        0x0000503cu  /* 第三方 P2P 登记本 */
+#define NV01_MEMORY_LOCAL_USER      0x00000040u  /* 物理 FB，REGISTER_VIDMEM 要这个 */
 #define NV01_MEMORY_LOCAL_PHYSICAL  0x000000c2u
 #define NV01_MEMORY_LIST_FBMEM      0x00000082u
 
@@ -56,6 +87,7 @@
 
 #define GDR_PAGE                    0x10000ull
 
+/* RM_ALLOC 旧包。GDB 里 x/8wx $x2 看到的就是这类字段。 */
 typedef struct {
     uint32_t hRoot;
     uint32_t hObjectParent;
@@ -86,6 +118,7 @@ typedef struct {
     uint32_t status;
 } nvos05_t;
 
+/* RM_CONTROL。cmd 在偏移 +8，就是你条件断点 *(uint32_t *)($x2+8) 盯的那个。 */
 typedef struct {
     uint32_t hClient;
     uint32_t hObject;
@@ -205,6 +238,10 @@ static fn_cuMemUnmap real_cuMemUnmap;
 static fn_cuMemSetAccess real_cuMemSetAccess;
 static fn_cuPointerSetAttribute real_cuPointerSetAttribute;
 
+/*
+ * 运行时状态：全是这次进程 ioctl 抓到的，不是写死的。
+ * target_gpu 来自环境变量 GPUDIRECT_GPU，默认 0。
+ */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int target_gpu;
@@ -274,6 +311,7 @@ static int is_memory_class(uint32_t hClass)
     }
 }
 
+/* 根据 RM_ALLOC 的 class 记账。handle 是 RM 返回的，每次不同。 */
 static void track_alloc(int fd, uint32_t hRoot, uint32_t hParent,
                         uint32_t hNew, uint32_t hClass, uint32_t status)
 {
@@ -365,6 +403,11 @@ static int call_ioctl(int fd, unsigned long request, void *arg)
     return real_ioctl(fd, request, arg);
 }
 
+/*
+ * 绑架 libc 的 ioctl：同名全局符号 + LD_PRELOAD 优先搜索。
+ * 先 call_ioctl → RTLD_NEXT 找到真 ioctl，成功后再偷看 RM_ALLOC。
+ * 我们自己发的 RM_ALLOC 0x503c 也会经过这里，track_alloc 会忽略非目标 class。
+ */
 int ioctl(int fd, unsigned long request, ...)
 {
     va_list ap;
@@ -384,6 +427,7 @@ int ioctl(int fd, unsigned long request, ...)
     return ret;
 }
 
+/* 我们主动发的 RM_ALLOC。走 call_ioctl，避免再进符号绑架后的逻辑死循环。 */
 static uint32_t rm_alloc(uint32_t hRoot, uint32_t hParent, uint32_t hClass,
                          void *parms, uint32_t parmsSize, uint32_t *hOut)
 {
@@ -429,6 +473,7 @@ static uint32_t rm_alloc(uint32_t hRoot, uint32_t hParent, uint32_t hClass,
     return p.status ? p.status : 0xffffffffu;
 }
 
+/* 我们主动发的 RM_CONTROL：REGISTER_VA_SPACE / REGISTER_VIDMEM。 */
 static uint32_t rm_ctrl(uint32_t hCli, uint32_t hObj, uint32_t cmd,
                         void *params, uint32_t paramsSize)
 {
@@ -449,6 +494,7 @@ static uint32_t rm_ctrl(uint32_t hCli, uint32_t hObj, uint32_t cmd,
     return c.status;
 }
 
+/* 每个 CUDA client 只建一本 0x503c，再登记一次 VA space。 */
 static int ensure_tpp_locked(void)
 {
     nv503c_alloc_t ap;
@@ -489,6 +535,7 @@ static int ensure_tpp_locked(void)
     return 0;
 }
 
+/* 把 (hMemory, CUDA VA, size) 写进登记本。地址/长度必须 64K 对齐。 */
 static int register_vidmem_locked(uint64_t va, uint64_t size, uint32_t hMemory)
 {
     nv503c_register_vidmem_t vm;
@@ -569,6 +616,10 @@ static int owns_va_locked(CUdeviceptr ptr)
     return 0;
 }
 
+/*
+ * 拿“真的” CUDA 符号：RTLD_NEXT 跳过本 so，避免拿到我们自己的 cuMemAlloc。
+ * 若 libcuda 还没加载，再 dlopen("libcuda.so.1")。
+ */
 static void *load_cuda_sym(const char *name)
 {
     void *h;
@@ -607,6 +658,10 @@ static void resolve_cuda(void)
         real_ioctl = (fn_ioctl)dlsym(RTLD_NEXT, "ioctl");
 }
 
+/*
+ * 替代 cuMemAlloc：VMM 会 RM_ALLOC class 0x40，ioctl hook 才能抓到 hMemory。
+ * 普通 cuMemAlloc 常走 UVM，RM 里没有可 REGISTER_VIDMEM 的对象。
+ */
 static CUresult vmm_alloc_and_register(CUdeviceptr *dptr, size_t bytesize)
 {
     CUmemAllocationProp prop;
@@ -715,6 +770,7 @@ static CUresult vmm_alloc_and_register(CUdeviceptr *dptr, size_t bytesize)
     return CUDA_SUCCESS;
 }
 
+/* 绑架 libcuda 的 cuDeviceGetAttribute。116/110 强制为 1，代替 nop 那条 tbz。 */
 CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib, CUdevice dev)
 {
     CUresult r;
@@ -732,6 +788,7 @@ CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib, CUdevice dev)
     return r;
 }
 
+/* 绑架 cuMemAlloc(_v2)：GDRCopy 调这个名字，实际走 VMM+登记。 */
 CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
 {
     CUresult r = vmm_alloc_and_register(dptr, bytesize);
@@ -752,6 +809,7 @@ CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytesize)
     return cuMemAlloc_v2(dptr, bytesize);
 }
 
+/* 绑架 SYNC_MEMOPS：4090D 上 VMM 指针会返回 801，GDRCopy 会在 pin 前 assert。 */
 CUresult cuPointerSetAttribute(const void *value, CUpointer_attribute attrib,
                                CUdeviceptr ptr)
 {
@@ -779,6 +837,7 @@ CUresult cuPointerSetAttribute(const void *value, CUpointer_attribute attrib,
     return r;
 }
 
+/* 绑架 cuMemCreate：打开抓 hMemory 窗口；RDMA 旗标失败则去掉再试。 */
 CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
                      const CUmemAllocationProp *prop, unsigned long long flags)
 {
@@ -808,6 +867,7 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
     return r;
 }
 
+/* 绑架 cuMemMap：GDRCopy 自己走 VMM 时，map 成功后立刻 REGISTER_VIDMEM。 */
 CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                   CUmemGenericAllocationHandle handle, unsigned long long flags)
 {
@@ -872,6 +932,7 @@ CUresult cuMemFree(CUdeviceptr dptr)
     return cuMemFree_v2(dptr);
 }
 
+/* .so 一被加载就跑（在 main 之前）。只读环境变量、解析真符号。 */
 __attribute__((constructor))
 static void gdr_geforce_init(void)
 {
