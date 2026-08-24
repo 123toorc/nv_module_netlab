@@ -28,6 +28,18 @@
  * 绑不住的情况：对方用 syscall(SYS_ioctl) 而不是 libc ioctl()；
  * 或者静态链接了 CUDA。当前 575 libcuda + GDRCopy 走的是动态符号。
  *
+ * urma_perftest 一类自己 dlopen(libcuda) 再 dlsym(handle, "cuMemAlloc_v2")
+ * 的 loader，不会走 PLT，所以本文件也拦截 libc 的 dlsym()，把我们导出的
+ * CUDA / ioctl 符号还回去。内部查“真符号”一律走 real_dlsym，避免递归。
+ *
+ * 全局 LD_PRELOAD / /etc/ld.so.preload：
+ *   ioctl() 符号仍会被每个进程绑到本 so（无法避免），但函数体只在
+ *   NVIDIA RM 设备（major 195 / /dev/nvidiactl / /dev/nvidiaN）上的
+ *   RM_ALLOC / RM_ALLOC_OBJECT 成功之后才加锁、拆包。其它 fd（socket、
+ *   tty、eventfd、/dev/null）只做一次 type/nr 判断就原样转发。
+ *   构造函数不再 dlopen libcuda，也不打印 loaded（除非
+ *   GDR_GEFORCE_VERBOSE=1）。
+ *
  * 这里没有写死你 GDB 里的 libcuda 地址（2a515c / 0x47d9d0 等）。
  * 写死的是 RM 公开协议；hClient / hMemory / VA 运行时从 ioctl 里抓。
  *
@@ -52,6 +64,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +82,7 @@
 #define NV_ESC_RM_ALLOC_OBJECT      0x28
 #define NV_ESC_RM_CONTROL           0x2A
 #define NV_ESC_RM_ALLOC             0x2B
+#define NVIDIA_RM_MAJOR             195u
 
 #define NV01_DEVICE_0               0x00000080u  /* GPU device */
 #define NV20_SUBDEVICE_0            0x00002080u  /* 0x503c 的 parent */
@@ -220,8 +235,10 @@ typedef CUresult (*fn_cuMemUnmap)(CUdeviceptr, size_t);
 typedef CUresult (*fn_cuMemSetAccess)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
 typedef CUresult (*fn_cuPointerSetAttribute)(const void *, CUpointer_attribute, CUdeviceptr);
 typedef int (*fn_ioctl)(int, unsigned long, ...);
+typedef void *(*fn_dlsym)(void *, const char *);
 
 static fn_ioctl real_ioctl;
+static fn_dlsym real_dlsym;
 static fn_cuDeviceGetAttribute real_cuDeviceGetAttribute;
 static fn_cuCtxGetDevice real_cuCtxGetDevice;
 static fn_cuMemAlloc real_cuMemAlloc;
@@ -260,6 +277,7 @@ static int capturing_memory;
 static uint32_t captured_hmemory;
 
 static int quiet;
+static int verbose;
 static int hook_ready;
 
 typedef struct vmm_alloc {
@@ -367,6 +385,112 @@ static void track_alloc(int fd, uint32_t hRoot, uint32_t hParent,
     }
 }
 
+static void resolve_real_dlsym(void)
+{
+    static const char *const vers[] = {
+        "GLIBC_2.17",
+        "GLIBC_2.2.5",
+        "GLIBC_2.34",
+        "GLIBC_2.27",
+        NULL
+    };
+    void *libc;
+    int i;
+
+    if (real_dlsym)
+        return;
+    /*
+     * 不能调我们自己导出的 dlsym()。dlvsym 不拦截。
+     * aarch64 openEuler 是 GLIBC_2.17；x86_64 常见 GLIBC_2.2.5。
+     */
+    for (i = 0; vers[i]; i++) {
+        real_dlsym = (fn_dlsym)dlvsym(RTLD_NEXT, "dlsym", vers[i]);
+        if (real_dlsym)
+            return;
+    }
+    libc = dlopen("libc.so.6", RTLD_NOW | RTLD_NOLOAD);
+    if (!libc)
+        libc = dlopen("libc.so.6", RTLD_NOW);
+    if (!libc)
+        return;
+    for (i = 0; vers[i] && !real_dlsym; i++)
+        real_dlsym = (fn_dlsym)dlvsym(libc, "dlsym", vers[i]);
+}
+
+static void *lookup_next(const char *name)
+{
+    resolve_real_dlsym();
+    if (!real_dlsym || !name)
+        return NULL;
+    return real_dlsym(RTLD_NEXT, name);
+}
+
+/*
+ * 只认会走 RM_ALLOC 的包。其它 ioctl（含 framebuffer 也用 magic 'F' 的
+ * FBIO*）直接转发，不 fstat、不加锁。
+ */
+static int is_rm_alloc_ioctl(unsigned long request)
+{
+    unsigned int type = (unsigned int)_IOC_TYPE(request);
+    unsigned int nr = (unsigned int)_IOC_NR(request);
+    unsigned int size = (unsigned int)_IOC_SIZE(request);
+
+    if (type != NV_IOCTL_MAGIC)
+        return 0;
+    if (nr == NV_ESC_RM_ALLOC)
+        return size == sizeof(nvos64_t) || size == sizeof(nvos21_t);
+    if (nr == NV_ESC_RM_ALLOC_OBJECT)
+        return size == sizeof(nvos05_t);
+    return 0;
+}
+
+static int nvidia_rm_dev_path(const char *p)
+{
+    unsigned int maj, mino;
+    const char *rest;
+
+    if (!p || !p[0])
+        return 0;
+    if (sscanf(p, "/dev/char/%u:%u", &maj, &mino) == 2)
+        return maj == NVIDIA_RM_MAJOR;
+    if (strncmp(p, "/dev/nvidia", 11) != 0)
+        return 0;
+    rest = p + 11;
+    if (strcmp(rest, "ctl") == 0)
+        return 1;
+    if (rest[0] < '0' || rest[0] > '9')
+        return 0;
+    do {
+        rest++;
+    } while (rest[0] >= '0' && rest[0] <= '9');
+    return rest[0] == '\0';
+}
+
+/* NVIDIA RM 节点：char major 195，或 /dev/nvidiactl、/dev/nvidia0..N。 */
+static int is_nvidia_rm_fd(int fd)
+{
+    struct stat st;
+    char link[64];
+    char path[256];
+    ssize_t n;
+
+    if (fd < 0)
+        return 0;
+    if (fstat(fd, &st) != 0)
+        return 0;
+    if (!S_ISCHR(st.st_mode))
+        return 0;
+    if (major(st.st_rdev) == NVIDIA_RM_MAJOR)
+        return 1;
+
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    n = readlink(link, path, sizeof(path) - 1);
+    if (n <= 0)
+        return 0;
+    path[n] = '\0';
+    return nvidia_rm_dev_path(path);
+}
+
 static void after_rm_alloc(int fd, unsigned long request, void *arg)
 {
     unsigned int nr = (unsigned int)_IOC_NR(request);
@@ -399,14 +523,19 @@ static void after_rm_alloc(int fd, unsigned long request, void *arg)
 static int call_ioctl(int fd, unsigned long request, void *arg)
 {
     if (!real_ioctl)
-        real_ioctl = (fn_ioctl)dlsym(RTLD_NEXT, "ioctl");
+        real_ioctl = (fn_ioctl)lookup_next("ioctl");
+    if (!real_ioctl) {
+        errno = ENOSYS;
+        return -1;
+    }
     return real_ioctl(fd, request, arg);
 }
 
 /*
- * 绑架 libc 的 ioctl：同名全局符号 + LD_PRELOAD 优先搜索。
- * 先 call_ioctl → RTLD_NEXT 找到真 ioctl，成功后再偷看 RM_ALLOC。
- * 我们自己发的 RM_ALLOC 0x503c 也会经过这里，track_alloc 会忽略非目标 class。
+ * 绑架 libc 的 ioctl：符号拦截无法按 fd 卸载，但解析只针对 NV RM 设备。
+ * 非 RM_ALLOC 形状的请求（socket/tty/eventfd/FBIO*）立刻转发，不加锁。
+ * 形状像 RM_ALLOC 时先做真 ioctl，成功后再 fstat，确认是 nvidiactl/nvidiaN
+ * 才拆包。我们自己发的 0x503c 走 call_ioctl，不进这里。
  */
 int ioctl(int fd, unsigned long request, ...)
 {
@@ -418,12 +547,16 @@ int ioctl(int fd, unsigned long request, ...)
     arg = va_arg(ap, void *);
     va_end(ap);
 
+    if (!is_rm_alloc_ioctl(request))
+        return call_ioctl(fd, request, arg);
+
     ret = call_ioctl(fd, request, arg);
-    if (ret == 0) {
-        pthread_mutex_lock(&lock);
-        after_rm_alloc(fd, request, arg);
-        pthread_mutex_unlock(&lock);
-    }
+    if (ret != 0 || !is_nvidia_rm_fd(fd))
+        return ret;
+
+    pthread_mutex_lock(&lock);
+    after_rm_alloc(fd, request, arg);
+    pthread_mutex_unlock(&lock);
     return ret;
 }
 
@@ -623,8 +756,10 @@ static int owns_va_locked(CUdeviceptr ptr)
 static void *load_cuda_sym(const char *name)
 {
     void *h;
-    void *s = dlsym(RTLD_NEXT, name);
+    void *s;
 
+    /* 必须用 real_dlsym：拦截后的 dlsym(libcuda, "cuMemAlloc_v2") 会返回我们自己。 */
+    s = lookup_next(name);
     if (s)
         return s;
     h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
@@ -632,7 +767,8 @@ static void *load_cuda_sym(const char *name)
         h = dlopen("libcuda.so.1", RTLD_LAZY);
     if (!h)
         return NULL;
-    return dlsym(h, name);
+    resolve_real_dlsym();
+    return real_dlsym ? real_dlsym(h, name) : NULL;
 }
 
 static void resolve_cuda(void)
@@ -655,7 +791,7 @@ static void resolve_cuda(void)
     real_cuMemSetAccess = load_cuda_sym("cuMemSetAccess");
     real_cuPointerSetAttribute = load_cuda_sym("cuPointerSetAttribute");
     if (!real_ioctl)
-        real_ioctl = (fn_ioctl)dlsym(RTLD_NEXT, "ioctl");
+        real_ioctl = (fn_ioctl)lookup_next("ioctl");
 }
 
 /*
@@ -932,7 +1068,10 @@ CUresult cuMemFree(CUdeviceptr dptr)
     return cuMemFree_v2(dptr);
 }
 
-/* .so 一被加载就跑（在 main 之前）。只读环境变量、解析真符号。 */
+/*
+ * .so 一被加载就跑（在 main 之前）。全局 preload 时每个进程都会进这里：
+ * 只读环境变量、解析 libc ioctl/dlsym。禁止 dlopen libcuda。
+ */
 __attribute__((constructor))
 static void gdr_geforce_init(void)
 {
@@ -940,14 +1079,52 @@ static void gdr_geforce_init(void)
 
     e = getenv("GDR_GEFORCE_QUIET");
     quiet = (e && e[0] != '0');
+    e = getenv("GDR_GEFORCE_VERBOSE");
+    verbose = (e && e[0] != '0');
     e = getenv("GPUDIRECT_GPU");
     if (!e)
         e = getenv("GDR_GEFORCE_GPU");
     if (e)
         target_gpu = atoi(e);
 
-    resolve_cuda();
+    resolve_real_dlsym();
+    if (!real_ioctl)
+        real_ioctl = (fn_ioctl)lookup_next("ioctl");
     hook_ready = 1;
-    logmsg("loaded (GPU %d). LD_PRELOAD hook: attr116=1, cuMemAlloc->VMM, RM 0x503c register\n",
-           target_gpu);
+    if (verbose)
+        logmsg("loaded (GPU %d). ioctl inspects only NVIDIA RM fds; cuMemAlloc->VMM\n",
+               target_gpu);
+}
+
+/*
+ * urma_perftest 的 cuda-loader：dlopen("libcuda.so.1") 后
+ * dlsym(handle, "cuMemAlloc_v2")，不走 PLT。这里把我们劫持的名字还回去。
+ * RTLD_NEXT 不改，内部 lookup_next / load_cuda_sym 才能拿到真实现。
+ */
+void *dlsym(void *handle, const char *name)
+{
+    resolve_real_dlsym();
+    if (!real_dlsym)
+        return NULL;
+    if (handle != RTLD_NEXT) {
+        if (strcmp(name, "ioctl") == 0)
+            return (void *)(uintptr_t)ioctl;
+        if (strcmp(name, "cuMemAlloc") == 0)
+            return (void *)(uintptr_t)cuMemAlloc;
+        if (strcmp(name, "cuMemAlloc_v2") == 0)
+            return (void *)(uintptr_t)cuMemAlloc_v2;
+        if (strcmp(name, "cuMemFree") == 0)
+            return (void *)(uintptr_t)cuMemFree;
+        if (strcmp(name, "cuMemFree_v2") == 0)
+            return (void *)(uintptr_t)cuMemFree_v2;
+        if (strcmp(name, "cuDeviceGetAttribute") == 0)
+            return (void *)(uintptr_t)cuDeviceGetAttribute;
+        if (strcmp(name, "cuPointerSetAttribute") == 0)
+            return (void *)(uintptr_t)cuPointerSetAttribute;
+        if (strcmp(name, "cuMemCreate") == 0)
+            return (void *)(uintptr_t)cuMemCreate;
+        if (strcmp(name, "cuMemMap") == 0)
+            return (void *)(uintptr_t)cuMemMap;
+    }
+    return real_dlsym(handle, name);
 }

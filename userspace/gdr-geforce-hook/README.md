@@ -43,10 +43,32 @@ Needs `gcc` only. No CUDA toolkit headers.
 export LD_PRELOAD=$PWD/libgdr_geforce_hook.so
 # optional: GPUDIRECT_GPU=0
 # optional: GDR_GEFORCE_QUIET=1
+# optional: GDR_GEFORCE_VERBOSE=1   # print "loaded" (off by default; needed for global preload)
 
 ./copybw
 # or ./validate / ./sanity
 ```
+
+### Global preload
+
+`ioctl()` is still the exported symbol (LD_PRELOAD cannot attach by fd), but
+the hook **only parses packets on NVIDIA RM nodes**: `/dev/nvidiactl`,
+`/dev/nvidiaN`, char major 195, and only for `RM_ALLOC` / `RM_ALLOC_OBJECT`.
+Socket / tty / eventfd / framebuffer `ioctl`s are forwarded with no lock.
+
+The constructor does **not** `dlopen` libcuda and does **not** print `loaded`
+unless `GDR_GEFORCE_VERBOSE=1`. Safe to leave in the login environment:
+
+```bash
+export LD_PRELOAD=/absolute/path/libgdr_geforce_hook.so
+```
+
+`sudo` still drops `LD_PRELOAD`. Already root: do not wrap with `sudo`.
+Otherwise use `sudo env LD_PRELOAD=/absolute/path/libgdr_geforce_hook.so ...`
+or `/etc/ld.so.preload` (survives sudo because it is not an env var).
+
+`urma_perftest` `dlopen`s libcuda and `dlsym`s `cuMemAlloc_v2` by handle.
+This `.so` also intercepts `dlsym` so that loader gets the VMM+register path.
 
 Success looks like:
 
