@@ -1,5 +1,15 @@
 # GDRCopy on GeForce / RTX 4090D — userspace hook
 
+## LD_PRELOAD 怎么拦截
+
+```bash
+export LD_PRELOAD=$PWD/libgdr_geforce_hook.so
+./gdrcopy_copylat
+```
+
+动态链接器先加载这个 `.so`。里面导出了和 `libc` / `libcuda` 同名的 `ioctl`、`cuMemAlloc` 等，所以进程里的调用先进 hook，再由 `dlsym(RTLD_NEXT, ...)` 转到真实现。不改 `libcuda` 文件偏移。详情见 `gdr_geforce_hook.c` 文件头。
+
+
 Do **not** patch the NVIDIA kernel modules for GDR. Keep
 [aikitoria `575.64.05-p2p`](https://github.com/aikitoria/open-gpu-kernel-modules/tree/575.64.05-p2p)
 as-is (that fork only enables GPU↔GPU BAR1 P2P).
