@@ -1,5 +1,29 @@
 # GDRCopy on GeForce / RTX 4090D — userspace hook
 
+## 拷到 UMDK（不要全局 `export LD_PRELOAD`）
+
+把本目录和旁边的 isolate 脚本拷进 UMDK 仓库根：
+
+```bash
+# 在 UMDK 仓库根
+cp -a /path/to/nv_module_netlab/userspace/gdr-geforce-hook userspace/
+cp /path/to/nv_module_netlab/userspace/isolate_umdk_gpu.sh ./
+./isolate_umdk_gpu.sh build $HOME/umdk_gpu_isolated
+```
+
+`isolate` 会现场 `make` hook，拷进隔离目录，并生成只给测试进程设
+`LD_PRELOAD` 的 `run.sh`。`cat` / 打开文件不会加载 so。
+
+```bash
+$HOME/umdk_gpu_isolated/run.sh \
+  $HOME/umdk_gpu_isolated/bin/urma_perftest write_lat_gpu \
+  --gpu-mode=peermem -d udmac0d1e2 ...
+# 关掉 hook: UMDK_GDR_HOOK=0 .../run.sh ...
+```
+
+`run.sh` 会拦 `dlsym(libcuda, "cuMemAlloc_v2")`（urma_perftest 的 loader）。
+成功日志要有 `cuMemAlloc -> VMM` 和 `REGISTER_VIDMEM status=0x0`。
+
 ## LD_PRELOAD 怎么拦截
 
 ```bash
