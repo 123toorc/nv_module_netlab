@@ -2,6 +2,9 @@ Apply on urma_driver branch sp4_driver:
   cd urma_driver && git checkout sp4_driver && git apply urma_driver-sp4-gpu-legacy-matt.patch
 Or pull the branch:
   git fetch origin cursor/udma-gpu-legacy-matt-5a36 && git checkout cursor/udma-gpu-legacy-matt-5a36
+After this overlay is loaded, if write_lat_gpu still hits ummu event 0x0a /
+URMA_CR_LOC_ACCESS_ERR (status 4), also apply urma_driver-sp4-gpu-sg-4k.patch
+(64KB NVIDIA pages split to 4KB; UMMU pgsize_bitmap has no 64KB leaf).
 
 --- a/urma/hw/udma/udma_segment.h
 +++ b/urma/hw/udma/udma_segment.h
