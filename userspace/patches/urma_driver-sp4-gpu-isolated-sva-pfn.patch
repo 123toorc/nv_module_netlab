@@ -1,0 +1,532 @@
+Apply on urma_driver after the 4K SG split (branch cursor/udma-gpu-sg-4k-5a36,
+or the tree currently running on node2):
+
+  cd urma_driver
+  git apply urma_driver-sp4-gpu-isolated-sva-pfn.patch
+
+Why: isolated SVA binds the process mm
+(iommu_sva_bind_device_isolated). Hardware walks mm->pgd, not the MATT
+PHYS-SG overlay. 4K SG install + software verify of every leaf including
+0x304219000 still left ummu event 0x0a on tid=104 and
+URMA_CR_LOC_ACCESS_ERR. Insert nvidia_p2p BAR PFNs at the CUDA VA so the
+isolated walk finds the same PAs GDR already mapped at a different CPU VA.
+
+--- a/urma/hw/udma/udma_gpu_p2p.c
++++ b/urma/hw/udma/udma_gpu_p2p.c
+@@ -49,6 +49,9 @@
+ #include <linux/module.h>
+ #include <linux/mm.h>
+ #include <linux/limits.h>
++#include <linux/pgtable.h>
++#include <linux/pfn.h>
++#include <linux/sched/mm.h>
+ #include <linux/scatterlist.h>
+ 
+ #include "udma_gpu_p2p.h"
+@@ -189,6 +192,10 @@
+  * Split each 64KB NV page into PAGE_SIZE (4KB) SG entries so
+  * ummu_sva_matt_map_phys_sg installs 4K leaves the UMMU can walk.
+  * sg_page remains NULL; the BAR PA stays in sg_dma_address.
++ *
++ * 4K split is still required for MATT PHYS-SG (no 64KB leaf). Isolated
++ * SVA hardware walks the process mm, not that overlay — see
++ * udma_gpu_isolated_sva_insert().
+  */
+ static int udma_gpu_build_sg_table(struct nvidia_p2p_page_table *page_table,
+ 				   struct sg_table *sgt)
+@@ -476,4 +483,318 @@
+ 	seg->is_gpu_seg = false;
+ }
+ 
++#ifndef pgprot_writecombine
++#define pgprot_writecombine pgprot_noncached
++#endif
++
++static struct sg_table *udma_gpu_seg_sgt(struct udma_segment *seg)
++{
++	if (!seg || !seg->umem)
++		return NULL;
++	return &seg->umem->append.sgt;
++}
++
++static unsigned long udma_gpu_sva_size(const struct udma_segment *seg)
++{
++	unsigned long size = (unsigned long)seg->gpu.mapped_size;
++
++	if (!size)
++		size = PAGE_ALIGN((unsigned long)seg->length);
++	return size;
++}
++
++static int udma_gpu_expected_pfn(struct sg_table *sgt, unsigned long base,
++				 unsigned long va, unsigned long *pfn)
++{
++	struct scatterlist *sg;
++	unsigned long off;
++	int i;
++
++	if (va < base)
++		return -EINVAL;
++	off = va - base;
++	for_each_sg(sgt->sgl, sg, sgt->nents, i) {
++		unsigned long plen = sg_dma_len(sg);
++
++		if (!plen)
++			continue;
++		if (off < plen) {
++			*pfn = PHYS_PFN((unsigned long)sg_dma_address(sg) + off);
++			return 0;
++		}
++		off -= plen;
++	}
++	return -EINVAL;
++}
++
++static int udma_gpu_mm_walk(struct mm_struct *mm, unsigned long va,
++			    unsigned long *pfn)
++{
++	pte_t *ptep;
++	spinlock_t *ptl;
++	int ret;
++
++	*pfn = 0;
++	mmap_read_lock(mm);
++	ret = follow_pte(mm, va, &ptep, &ptl);
++	if (ret) {
++		mmap_read_unlock(mm);
++		return ret;
++	}
++	if (pte_none(*ptep) || !pte_present(*ptep))
++		ret = -ENOENT;
++	else
++		*pfn = pte_pfn(*ptep);
++	pte_unmap_unlock(ptep, ptl);
++	mmap_read_unlock(mm);
++	return ret;
++}
++
++static void udma_gpu_sva_walk_log(struct mm_struct *mm, unsigned long va,
++				  const char *tag)
++{
++	unsigned long pfn;
++	int ret;
++
++	ret = udma_gpu_mm_walk(mm, va, &pfn);
++	if (ret)
++		pr_info("UDMA GPU isolated SVA: walk %s va=0x%lx empty/err ret=%d\n",
++			tag, va, ret);
++	else
++		pr_info("UDMA GPU isolated SVA: walk %s va=0x%lx pfn=0x%lx pa=0x%llx\n",
++			tag, va, pfn, (u64)pfn << PAGE_SHIFT);
++}
++
++static bool udma_gpu_sva_already_bar(struct mm_struct *mm, unsigned long va,
++				     unsigned long size, struct sg_table *sgt)
++{
++	unsigned long addrs[3];
++	unsigned long pfn, expected;
++	int n = 0;
++	int i;
++
++	addrs[n++] = va;
++	if (size > 0x19000)
++		addrs[n++] = va + 0x19000;
++	if (size > PAGE_SIZE)
++		addrs[n++] = va + size - PAGE_SIZE;
++
++	for (i = 0; i < n; i++) {
++		if (udma_gpu_mm_walk(mm, addrs[i], &pfn))
++			return false;
++		if (udma_gpu_expected_pfn(sgt, va, addrs[i], &expected))
++			return false;
++		if (pfn != expected)
++			return false;
++	}
++	return true;
++}
++
++static int udma_gpu_sva_verify(struct mm_struct *mm, unsigned long va,
++			       unsigned long size, struct sg_table *sgt)
++{
++	unsigned long addrs[3];
++	unsigned long pfn, expected;
++	int n = 0;
++	int i;
++	int ret;
++
++	addrs[n++] = va;
++	if (size > 0x19000)
++		addrs[n++] = va + 0x19000;
++	if (size > PAGE_SIZE)
++		addrs[n++] = va + size - PAGE_SIZE;
++
++	for (i = 0; i < n; i++) {
++		ret = udma_gpu_mm_walk(mm, addrs[i], &pfn);
++		if (ret) {
++			pr_err("UDMA GPU isolated SVA: verify walk va=0x%lx ret=%d\n",
++			       addrs[i], ret);
++			return ret;
++		}
++		ret = udma_gpu_expected_pfn(sgt, va, addrs[i], &expected);
++		if (ret || pfn != expected) {
++			pr_err("UDMA GPU isolated SVA: verify mismatch va=0x%lx got=0x%lx exp=0x%lx\n",
++			       addrs[i], pfn, expected);
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++static void udma_gpu_sva_zap(struct mm_struct *mm, unsigned long va,
++			     unsigned long size)
++{
++	struct vm_area_struct *vma;
++
++	if (!mm)
++		return;
++	mmap_write_lock(mm);
++	vma = vma_lookup(mm, va);
++	if (vma && va >= vma->vm_start && va + size <= vma->vm_end &&
++	    (vma->vm_flags & VM_PFNMAP))
++		zap_vma_ptes(vma, va, size);
++	mmap_write_unlock(mm);
++}
++
++/*
++ * Isolated SVA binds the process mm:
++ *   iommu_sva_bind_device_isolated(dev, current->mm, NULL)
++ * so hardware walks mm->pgd, not the MATT PHYS-SG overlay. Node2 proved
++ * this: every 4K MATT entry including the write_lat send VA 0x304219000
++ * software-verified, then ummu event 0x0a still fired on tid=104 (the
++ * isolated SVA context) and userspace got URMA_CR_LOC_ACCESS_ERR.
++ *
++ * GDR BAR mmap is a different VA (e.g. 0xffffa4990000). NIC WRs use the
++ * CUDA VA. Install the nvidia_p2p BAR PFNs at that CUDA VA, same pattern
++ * as udma_get_page_priv() (zap_vma_ptes + remap_pfn_range).
++ */
++int udma_gpu_isolated_sva_insert(struct mm_struct *mm, struct udma_segment *seg)
++{
++	struct sg_table *sgt;
++	struct scatterlist *sg;
++	struct vm_area_struct *vma;
++	unsigned long va, size, addr, pfn;
++	pgprot_t prot;
++	int i, ret;
++
++	if (!mm || !seg || !seg->is_gpu_seg)
++		return -EINVAL;
++	if (seg->gpu.sva_pfn_mapped)
++		return 0;
++
++	sgt = udma_gpu_seg_sgt(seg);
++	if (!sgt || !sgt->sgl || !sgt->nents)
++		return -EINVAL;
++
++	va = (unsigned long)seg->addr;
++	size = udma_gpu_sva_size(seg);
++	if (!PAGE_ALIGNED(va) || !size || !PAGE_ALIGNED(size))
++		return -EINVAL;
++
++	udma_gpu_sva_walk_log(mm, va, "before-start");
++	if (size > 0x19000)
++		udma_gpu_sva_walk_log(mm, va + 0x19000, "before-send");
++
++	if (udma_gpu_sva_already_bar(mm, va, size, sgt)) {
++		pr_info("UDMA GPU isolated SVA: process PT already has BAR PFNs va=0x%lx size=0x%lx\n",
++			va, size);
++		seg->gpu.sva_pfn_mapped = true;
++		seg->gpu.sva_pfn_owned = false;
++		return 0;
++	}
++
++	mmap_write_lock(mm);
++	vma = vma_lookup(mm, va);
++	if (!vma || va < vma->vm_start || va + size > vma->vm_end) {
++		mmap_write_unlock(mm);
++		pr_err("UDMA GPU isolated SVA: no VMA covering CUDA va=0x%lx size=0x%lx "
++		       "(isolated SVA walks mm, not the MATT overlay)\n",
++		       va, size);
++		return -ENOENT;
++	}
++
++	if (!(vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))) {
++		pr_err("UDMA GPU isolated SVA: VMA [0x%lx,0x%lx) flags=0x%lx not PFNMAP/MIXEDMAP\n",
++		       vma->vm_start, vma->vm_end, (unsigned long)vma->vm_flags);
++		mmap_write_unlock(mm);
++		return -EOPNOTSUPP;
++	}
++
++	prot = pgprot_writecombine(vma->vm_page_prot);
++	pr_info("UDMA GPU isolated SVA: vma [0x%lx,0x%lx) flags=0x%lx prot=0x%llx -> wc=0x%llx\n",
++		vma->vm_start, vma->vm_end, (unsigned long)vma->vm_flags,
++		(u64)pgprot_val(vma->vm_page_prot), (u64)pgprot_val(prot));
++
++	if (vma->vm_flags & VM_PFNMAP)
++		zap_vma_ptes(vma, va, size);
++
++	addr = va;
++	for_each_sg(sgt->sgl, sg, sgt->nents, i) {
++		unsigned long plen = sg_dma_len(sg);
++
++		if (!plen || !PAGE_ALIGNED(plen) ||
++		    !PAGE_ALIGNED((unsigned long)sg_dma_address(sg))) {
++			ret = -EINVAL;
++			goto fail_unlock;
++		}
++		pfn = PHYS_PFN((unsigned long)sg_dma_address(sg));
++		if (vma->vm_flags & VM_PFNMAP) {
++			ret = remap_pfn_range(vma, addr, pfn, plen, prot);
++		} else {
++			unsigned long a, p, e;
++
++			ret = 0;
++			e = addr + plen;
++			for (a = addr, p = pfn; a < e; a += PAGE_SIZE, p++) {
++				ret = vm_insert_pfn(vma, a, p);
++				if (ret)
++					break;
++			}
++		}
++		if (ret) {
++			pr_err("UDMA GPU isolated SVA: remap va=0x%lx pfn=0x%lx len=0x%lx ret=%d\n",
++			       addr, pfn, plen, ret);
++			goto fail_unlock;
++		}
++		addr += plen;
++	}
++	if (addr != va + size) {
++		pr_err("UDMA GPU isolated SVA: SG coverage 0x%lx != size 0x%lx\n",
++		       addr - va, size);
++		ret = -EIO;
++		goto fail_unlock;
++	}
++	mmap_write_unlock(mm);
++
++	ret = udma_gpu_sva_verify(mm, va, size, sgt);
++	if (ret) {
++		udma_gpu_sva_zap(mm, va, size);
++		return ret;
++	}
++
++	udma_gpu_sva_walk_log(mm, va, "after-start");
++	if (size > 0x19000)
++		udma_gpu_sva_walk_log(mm, va + 0x19000, "after-send");
++
++	seg->gpu.sva_pfn_mapped = true;
++	seg->gpu.sva_pfn_owned = true;
++	pr_info("UDMA GPU isolated SVA: inserted BAR PFNs va=0x%lx size=0x%lx nents=%u\n",
++		va, size, sgt->nents);
++	return 0;
++
++fail_unlock:
++	if (vma->vm_flags & VM_PFNMAP)
++		zap_vma_ptes(vma, va, size);
++	mmap_write_unlock(mm);
++	return ret;
++}
++
++void udma_gpu_isolated_sva_remove(struct mm_struct *mm, struct udma_segment *seg)
++{
++	unsigned long va, size;
++	bool owned;
++
++	if (!seg || !seg->gpu.sva_pfn_mapped)
++		return;
++
++	owned = seg->gpu.sva_pfn_owned;
++	seg->gpu.sva_pfn_mapped = false;
++	seg->gpu.sva_pfn_owned = false;
++	if (!owned)
++		return;
++
++	va = (unsigned long)seg->addr;
++	size = udma_gpu_sva_size(seg);
++
++	if (!mm || !mmget_not_zero(mm)) {
++		pr_info("UDMA GPU isolated SVA: skip zap va=0x%lx (mm gone)\n", va);
++		return;
++	}
++	udma_gpu_sva_zap(mm, va, size);
++	mmput(mm);
++	pr_info("UDMA GPU isolated SVA: zapped BAR PFNs va=0x%lx size=0x%lx\n",
++		va, size);
++}
++
+ #endif /* UDMA_GPU_P2P_ENABLE */
+
+--- a/urma/hw/udma/udma_gpu_p2p.h
++++ b/urma/hw/udma/udma_gpu_p2p.h
+@@ -35,6 +35,8 @@
+ #include "udma_dev.h"
+ #include "udma_segment.h"
+ 
++struct mm_struct;
++
+ /*
+  * GPU兼容测试补丁: 1=启用本文件 API（需要 nv-p2p.h，即 NV_P2P_HEADER_PATH
+  * 指向的目录存在）；0=编译为空 stub 返回 -ENOTSUPP，完全不需要任何
+@@ -166,6 +168,14 @@
+  */
+ void udma_gpu_unpin_seg_pages(struct udma_segment *seg);
+ 
++/*
++ * Isolated SVA walks the process mm (iommu_sva_bind_device_isolated).
++ * CUDA VAs are not BAR PTEs in that mm; insert nvidia_p2p BAR PFNs at
++ * the CUDA VA so local WRITE sources translate.
++ */
++int udma_gpu_isolated_sva_insert(struct mm_struct *mm, struct udma_segment *seg);
++void udma_gpu_isolated_sva_remove(struct mm_struct *mm, struct udma_segment *seg);
++
+ #else
+ 
+ static inline int udma_gpu_pin_seg_pages(struct udma_dev *dev,
+@@ -177,6 +187,17 @@
+ 
+ static inline void udma_gpu_unpin_seg_pages(struct udma_segment *seg) {}
+ 
++static inline int udma_gpu_isolated_sva_insert(struct mm_struct *mm,
++					       struct udma_segment *seg)
++{
++	return -ENOTSUPP;
++}
++
++static inline void udma_gpu_isolated_sva_remove(struct mm_struct *mm,
++						struct udma_segment *seg)
++{
++}
++
+ #endif
+ 
+ #endif /* __UDMA_GPU_P2P_H__ */
+
+--- a/urma/hw/udma/udma_segment.h
++++ b/urma/hw/udma/udma_segment.h
+@@ -25,8 +25,10 @@
+  *              重复调用未定义），只做本地清理。
+  *              这是 TODO：正确做法应该在此时通知 ubcore/上层使该段失效，
+  *              当前测试补丁只打印错误日志，不做进一步传播。
+- * matt_mapped: isolated SVA (sva_sep_mode_en == 0) 下已为该 GPU VA 安装
+- *              MATT physical-SG overlay。unregister 时必须先 unmap 再 unpin。
++ * matt_mapped: isolated SVA 下已为该 GPU VA 安装 MATT physical-SG
++ *              overlay（token/remote tid）。unregister 时先 unmap。
++ * sva_pfn_mapped: 进程页表在 CUDA VA 上已能 walk 到 BAR PFN。
++ * sva_pfn_owned:  本驱动 remap 进去的，unregister 时必须 zap。
+  */
+ struct udma_gpu_p2p_mem {
+ 	struct nvidia_p2p_page_table *page_table;
+@@ -34,6 +36,8 @@
+ 	uint64_t mapped_size;
+ 	bool force_freed;
+ 	bool matt_mapped;
++	bool sva_pfn_mapped;
++	bool sva_pfn_owned;
+ };
+ 
+ struct udma_segment {
+
+--- a/urma/hw/udma/udma_segment.c
++++ b/urma/hw/udma/udma_segment.c
+@@ -734,11 +734,11 @@
+ }
+ 
+ /*
+- * Isolated SVA (sva_sep_mode_en == 0) binds the process mm and walks
+- * CPU page tables. CUDA GPU VAs are not backed by the nvidia_p2p BAR
+- * PAs in those tables, so a successful get_pages still UMMU-faults
+- * (event 0x0a at an address inside the GPU VA). Install a MATT
+- * physical-SG overlay at the GPU VA.
++ * Isolated SVA binds the process mm
++ * (iommu_sva_bind_device_isolated). Hardware walks mm->pgd.
++ * MATT PHYS-SG is kept for the token/remote tid path, but it is not
++ * the table isolated local DMA walks — that needs BAR PFNs in the
++ * process page table (udma_gpu_isolated_sva_insert).
+  *
+  * Do not call udma_iommu_local_map() here: that path uses
+  * ctx->seg_tree, which is only allocated when sva_sep_mode_en == 1.
+@@ -849,26 +849,48 @@
+ 		/*
+ 		 * Isolated SVA (sva_sep_mode_en == 0): no ctx->seg_tree.
+ 		 * HOST: pin only; UMMU walks the process page tables.
+-		 * GPU:  pin BAR PAs, then install a MATT phys-SG overlay.
+-		 *       Do not call udma_pin_pages_and_ioummu_map() here.
++		 * GPU:  pin BAR PAs, insert those PFNs into the process
++		 *       mm at the CUDA VA, then keep the MATT overlay
++		 *       for the token/remote tid. Do not call
++		 *       udma_pin_pages_and_ioummu_map() here.
+ 		 */
+ 		if (udma_seg_cfg_is_gpu(cfg)) {
++			struct udma_context *ctx = udata ?
++				to_udma_context(udata->uctx) : NULL;
++			struct mm_struct *sva_mm = (ctx && ctx->mm) ?
++				ctx->mm : current->mm;
++
+ 			printk("GPU pin pages\n");
+ 			ret = udma_gpu_pin_seg_pages(udma_dev, seg, cfg);
+ 			if (!ret)
+ 				seg->tid = udma_tid->tid;
+ 			if (!ret && udata) {
+-				ret = udma_gpu_matt_map_isolated(
+-					to_udma_context(udata->uctx), seg);
++				ret = udma_gpu_isolated_sva_insert(sva_mm, seg);
+ 				if (ret) {
+ 					dev_err(udma_dev->dev,
+-						"GPU isolated MATT map failed va=0x%llx len=0x%llx ret=%d\n",
++						"GPU isolated SVA PFN insert failed va=0x%llx len=0x%llx ret=%d\n",
+ 						seg->addr, seg->length, ret);
+ 					udma_gpu_unpin_seg_pages(seg);
+ 				} else {
+-					dev_info(udma_dev->dev,
+-						 "GPU isolated MATT map OK va=0x%llx len=0x%llx tid=%u\n",
+-						 seg->addr, seg->length, seg->tid);
++					ret = udma_gpu_matt_map_isolated(ctx, seg);
++					if (ret) {
++						dev_err(udma_dev->dev,
++							"GPU isolated MATT map failed va=0x%llx len=0x%llx ret=%d\n",
++							seg->addr, seg->length, ret);
++						udma_gpu_isolated_sva_remove(sva_mm, seg);
++						udma_gpu_unpin_seg_pages(seg);
++					} else {
++						udma_iotlb_sync(udma_dev,
++								seg->addr,
++								seg->length);
++						dev_info(udma_dev->dev,
++							 "GPU isolated SVA+MATT OK va=0x%llx len=0x%llx tid=%u sva_pfn=%d owned=%d matt=%d\n",
++							 seg->addr, seg->length,
++							 seg->tid,
++							 seg->gpu.sva_pfn_mapped,
++							 seg->gpu.sva_pfn_owned,
++							 seg->gpu.matt_mapped);
++					}
+ 				}
+ 			}
+ 		} else {
+@@ -883,9 +905,11 @@
+ 
+ 	if (udata) {
+ 		dev_info(udma_dev->dev,
+-			 "MATT END:kernel_mode=%d gpu=%d sva_sep=%d matt_mapped=%d\n",
++			 "MATT END:kernel_mode=%d gpu=%d sva_sep=%d sva_pfn=%d owned=%d matt_mapped=%d\n",
+ 			 seg->kernel_mode, udma_seg_is_gpu(seg),
+-			 udma_dev->caps.sva_sep_mode_en, seg->gpu.matt_mapped);
++			 udma_dev->caps.sva_sep_mode_en,
++			 seg->gpu.sva_pfn_mapped, seg->gpu.sva_pfn_owned,
++			 seg->gpu.matt_mapped);
+ 		return &seg->core_tseg;
+ 	}
+ 		
+@@ -969,9 +993,12 @@
+ 		udma_unpin_pages_and_unioummu_map(to_udma_context(ubcore_seg->uctx),
+ 						  seg, udma_tid->tid);
+ 	} else {
+-		if (udma_seg_is_gpu(seg) && ubcore_seg->uctx)
+-			udma_gpu_matt_unmap_isolated(
+-				to_udma_context(ubcore_seg->uctx), seg);
++		if (udma_seg_is_gpu(seg) && ubcore_seg->uctx) {
++			struct udma_context *ctx = to_udma_context(ubcore_seg->uctx);
++
++			udma_gpu_isolated_sva_remove(ctx->mm, seg);
++			udma_gpu_matt_unmap_isolated(ctx, seg);
++		}
+ 		udma_unpin_seg(seg, true);
+ 	}
+ 	seg->token_value = 0;
