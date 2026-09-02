@@ -1,30 +1,34 @@
-# 4090 打通 GDR 讲座 PPT
+# 4090 · BAR1 P2P 与 GPUDirect RDMA 讲义
 
-面向内核背景不多的基础程序员。45–60 分钟。
+纸面风格。把 P2P 与 GDR 分开讲，再说明为何只改 flag 就能在内核侧适配 GDR，以及用户态为何还要补登记。
 
 | 文件 | 用途 |
 |---|---|
-| [4090-gdr-ioctl-hook.pptx](4090-gdr-ioctl-hook.pptx) | 讲稿。每页备注栏是口播稿，请用**演讲者视图** |
-| [build_4090_gdr_lecture.py](build_4090_gdr_lecture.py) | 重新生成 PPT |
+| [4090-gdr-ioctl-hook.pptx](4090-gdr-ioctl-hook.pptx) | 讲义。备注是提纲 |
+| [build_4090_gdr_lecture.py](build_4090_gdr_lecture.py) | 重新生成 |
+
+## 层次（由下而上）
+
+1. **窗**：BAR1。GPU↔GPU 与网卡 DMA 的数据面。
+2. **申报**：`p2pGetCaps` 得到 `PCIE_BAR1`。`NV50_P2P` 与 `NV50_THIRD_PARTY_P2P` 过同一道检查。aikitoria 改的是这类 flag，外加把 BAR1 扩到 32 GB。
+3. **登记**：`0x503c`。Tesla 的 libcuda 写，GeForce 不写。`.so` 只补这一层。
 
 ## 怎么讲
 
-1. PowerPoint / LibreOffice 打开 pptx，切到**演讲者视图**（备注在下半屏）。
-2. 不要只念正文。正文是给听众看的骨架，细节在备注里。
-3. 建议节奏：开场+比喻 10 分钟 → Harry 5090 8 分钟 → 弯路与借鉴 6 分钟 → ioctl / VMM / 登记本 20 分钟 → 对照、怎么跑、Q&A 12 分钟。
-4. 验收标准只讲到：`gdr_pin_buffer` 不再 `-22`，日志里有 `REGISTER_VIDMEM status=0x0`。UMMU / SVA / MATT 是下一场，本场只留一页边界。
+用演讲者视图。不要把备注念成演说。建议顺序即页序：混淆 → BAR1 → GPU P2P / flag → 为何 GDR 可适配 → 登记与 hook → 验证。
+
+验收：`REGISTER_VIDMEM status=0x0`，且 `gdr_pin_buffer` 不再 `-22`。UMMU 不在本场。
 
 ## 重新生成
 
 ```bash
-python3 -m pip install python-pptx
 python3 userspace/gdr-geforce-hook/talks/build_4090_gdr_lecture.py
 ```
 
-字体按 Windows 讲者习惯写成「微软雅黑」+ Consolas。若中文方框：装微软雅黑，或在演示软件里把主题字体换成本机 CJK 字体。
+标题字体按「宋体」、正文「微软雅黑」。若方框，在演示软件里换成机器上的对应 CJK 字体。
 
-## 不要在讲座里提倡的
+## 不要提倡
 
-- 为 GDR 再改 4090 的 NVIDIA 内核（BAR1 P2P 用 aikitoria 即可）
-- 全局 `export LD_PRELOAD` 或写 `/etc/ld.so.preload`
-- 把 Harry 的 libcuda 一字节补丁当成 GDRCopy / peermem 的完整方案
+- 为 GDR 再改 4090 的 NVIDIA 内核
+- 全局 `LD_PRELOAD`
+- 把 Harry 的 libcuda 一字节当成 peermem 的完整方案
